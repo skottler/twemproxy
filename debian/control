@@ -3,10 +3,10 @@ Section: database
 Priority: extra
 Maintainer: Sam Kottler <shk@linux.com>
 Build-Depends: debhelper (>= 8.0.0), autotools-dev
-Standards-Version: 3.9.4
+Standards-Version: 3.9.3
 Homepage: https://github.com/twitter/twemproxy
 
 Package: twemproxy
 Architecture: amd64
 Depends: ${misc:Depends}
-Description: A fast and lightweight proxy for memcached and redis protocol.
+Description: Fast and lightweight proxy for memcached and redis protocol.
