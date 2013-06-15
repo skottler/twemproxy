@@ -1,0 +1,2256 @@
+Description: Import from the upstream source tree.
+ .
+ twemproxy (0.2.4-1) unstable; urgency=low
+ .
+   * Initial release
+Author: Sam Kottler <shk@linux.com>
+
+---
+The information above should follow the Patch Tagging Guidelines, please
+checkout http://dep.debian.net/deps/dep3/ to learn about the format. Here
+are templates for supplementary fields that you might want to add:
+
+Origin: <vendor|upstream|other>, <url of original patch>
+Bug: <url in upstream bugtracker>
+Bug-Debian: http://bugs.debian.org/<bugnumber>
+Bug-Ubuntu: https://launchpad.net/bugs/<bugnumber>
+Forwarded: <no|not-needed|url proving that it has been forwarded>
+Reviewed-By: <name and email of someone who approved the patch>
+Last-Update: <YYYY-MM-DD>
+
+--- twemproxy-0.2.4.orig/README.md
++++ twemproxy-0.2.4/README.md
+@@ -77,7 +77,8 @@ nutcracker can be configured through a Y
+  + one_at_a_time
+  + md5
+  + crc16
+- + crc32
++ + crc32 (crc32 implementation compatible with [libmemcached](http://libmemcached.org/))
++ + crc32a (correct crc32 implementation as per the spec)
+  + fnv1_64
+  + fnv1a_64
+  + fnv1_32
+@@ -218,12 +219,19 @@ Pipelining is the reason why nutcracker
+ 
+ If you are deploying nutcracker in production, you might consider reading through the [recommendation document](notes/recommendation.md) to understand the parameters you could tune in nutcracker to run it efficiently in the production environment.
+ 
++## Utils
+++ [nagios checks](https://github.com/wanelo/nagios-checks/blob/master/check_twemproxy)
+++ [circunous](https://github.com/wanelo-chef/nad-checks/blob/master/recipes/twemproxy.rb)
+++ [puppet module](https://github.com/wuakitv/puppet-twemproxy)
++
+ ## Users
+ + [Pinterest](http://pinterest.com/)
+ + [Tumblr](https://www.tumblr.com/)
+ + [Twitter](https://twitter.com/)
+ + [Vine](http://vine.co/)
+ + [Kiip](http://www.kiip.me/)
+++ [Wuaki.tv](https://wuaki.tv/)
+++ [Wanelo](http://wanelo.com/)
+ 
+ ## Issues and Support
+ 
+--- twemproxy-0.2.4.orig/configure.ac
++++ twemproxy-0.2.4/configure.ac
+@@ -67,7 +67,10 @@ AC_CHECK_HEADERS([fcntl.h float.h limits
+ AC_CHECK_HEADERS([inttypes.h stdint.h])
+ AC_CHECK_HEADERS([sys/ioctl.h sys/time.h sys/uio.h])
+ AC_CHECK_HEADERS([sys/socket.h sys/un.h netinet/in.h arpa/inet.h netdb.h])
+-AC_CHECK_HEADERS([sys/epoll.h], [], [AC_MSG_ERROR([required sys/epoll.h header file is missing])])
++AC_CHECK_HEADERS([execinfo.h],
++  [AC_DEFINE(HAVE_BACKTRACE, [1], [Define to 1 if backtrace is supported])], [])
++AC_CHECK_HEADERS([sys/epoll.h], [], [])
++AC_CHECK_HEADERS([sys/event.h], [], [])
+ 
+ # Checks for libraries
+ AC_CHECK_LIB([m], [pow])
+@@ -100,7 +103,36 @@ main(int argc, char **argv)
+     exit(0);
+ }
+   ], [ac_cv_epoll_works=yes], [ac_cv_epoll_works=no]))
+-AS_IF([test "x$ac_cv_epoll_works" = "xyes"], [], [AC_MSG_FAILURE([Linux epoll(7) API is missing])])
++AS_IF([test "x$ac_cv_epoll_works" = "xyes"],
++  [AC_DEFINE([HAVE_EPOLL], [1], [Define to 1 if epoll is supported])], [])
++
++AC_CACHE_CHECK([if kqueue works], [ac_cv_kqueue_works],
++  AC_TRY_RUN([
++#include <stdio.h>
++#include <stdlib.h>
++#include <sys/types.h>
++#include <sys/event.h>
++#include <sys/time.h>
++int
++main(int argc, char **argv)
++{
++    int fd;
++
++    fd = kqueue();
++    if (fd < 0) {
++        perror("kqueue:");
++        exit(1);
++    }
++    exit(0);
++}
++  ], [ac_cv_kqueue_works=yes], [ac_cv_kqueue_works=no]))
++AS_IF([test "x$ac_cv_kqueue_works" = "xyes"],
++  [AC_DEFINE([HAVE_KQUEUE], [1], [Define to 1 if kqueue is supported])], [])
++
++AS_IF([test "x$ac_cv_epoll_works" = "xno" &&
++       test "x$ac_cv_kqueue_works" = "xno"],
++  [AC_MSG_ERROR([either epoll or kqueue support is required])], [])
++
+ 
+ # Package options
+ AC_MSG_CHECKING([whether to enable debug logs and asserts])
+@@ -149,7 +181,8 @@ AC_CONFIG_FILES([Makefile
+                  contrib/Makefile
+                  src/Makefile
+                  src/hashkit/Makefile
+-                 src/proto/Makefile])
++                 src/proto/Makefile
++                 src/event/Makefile])
+ 
+ # Generate the "configure" script
+ AC_OUTPUT
+--- twemproxy-0.2.4.orig/Makefile.am
++++ twemproxy-0.2.4/Makefile.am
+@@ -4,4 +4,6 @@ ACLOCAL_AMFLAGS = -I m4
+ 
+ SUBDIRS = contrib src
+ 
++dist_man_MANS = man/nutcracker.8
++
+ EXTRA_DIST = README.md NOTICE LICENSE ChangeLog conf scripts notes
+--- twemproxy-0.2.4.orig/notes/redis.md
++++ twemproxy-0.2.4/notes/redis.md
+@@ -83,7 +83,7 @@
+     +-------------------+------------+---------------------------------------------------------------------------------------------------------------------+
+     |      PSETEX       |    Yes     | PSETEX key milliseconds value                                                                                       |
+     +-------------------+------------+---------------------------------------------------------------------------------------------------------------------+
+-    |      SET          |    Yes     | SET key value                                                                                                       |
++    |      SET          |    Yes     | SET key value [EX seconds] [PX milliseconds] [NX|XX]                                                                |
+     +-------------------+------------+---------------------------------------------------------------------------------------------------------------------+
+     |      SETBIT       |    Yes     | SETBIT key offset value                                                                                             |
+     +-------------------+------------+---------------------------------------------------------------------------------------------------------------------+
+--- twemproxy-0.2.4.orig/scripts/redis-check.sh
++++ twemproxy-0.2.4/scripts/redis-check.sh
+@@ -90,6 +90,7 @@ printf '\ndecrby\n'
+ printf '*3\r\n$6\r\ndecrby\r\n$7\r\ncounter\r\n$3\r\n100\r\n' | socat ${debug} ${timeout} - TCP:localhost:${port},shut-close
+ 
+ printf '\nget\n'
++printf '*2\r\n$3\r\nget\r\n$16\r\nnon-existent-key\r\n' | socat ${debug} ${timeout} - TCP:localhost:${port},shut-close
+ printf '*2\r\n$3\r\nget\r\n$3\r\nfoo\r\n' | socat ${debug} ${timeout} - TCP:localhost:${port},shut-close
+ printf '*2\r\n$3\r\ndel\r\n$3\r\nfoo\r\n' | socat ${debug} ${timeout} - TCP:localhost:${port},shut-close
+ printf '*2\r\n$3\r\nget\r\n$3\r\nfoo\r\n' | socat ${debug} ${timeout} - TCP:localhost:${port},shut-close
+@@ -570,4 +571,4 @@ printf '*3\r\n$4\r\neval\r\n$10\r\nretur
+ printf '*4\r\n$4\r\neval\r\n$10\r\nreturn 123\r\n$1\r\n1\r\n$1\r\n1\r\n' | socat ${debug} ${timeout} - TCP:localhost:${port},shut-close
+ printf '*7\r\n$4\r\neval\r\n$40\r\nreturn {KEYS[1],KEYS[2],ARGV[1],ARGV[2]}\r\n$1\r\n2\r\n$9\r\nkey1{tag}\r\n$4\r\narg1\r\n$9\r\nkey2{tag}\r\n$4\r\narg2\r\n' | socat ${debug} ${timeout} - TCP:localhost:${port},shut-close
+ printf '*9\r\n$4\r\neval\r\n$56\r\nreturn {KEYS[1],KEYS[2],KEYS[3],ARGV[1],ARGV[2],ARGV[3]}\r\n$1\r\n3\r\n$9\r\nkey1{tag}\r\n$4\r\narg1\r\n$9\r\nkey2{tag}\r\n$4\r\narg2\r\n$9\r\nkey3{tag}\r\n$4\r\narg3\r\n' | socat ${debug} ${timeout} - TCP:localhost:${port},shut-close
+-
++printf '*4\r\n$4\r\neval\r\n$11\r\nreturn {10}\r\n$1\r\n1\r\n$4\r\nTEMP\r\n' | socat ${debug} ${timeout} - TCP:localhost:${port},shut-close
+--- twemproxy-0.2.4.orig/src/nc_response.c
++++ twemproxy-0.2.4/src/nc_response.c
+@@ -17,7 +17,6 @@
+ 
+ #include <nc_core.h>
+ #include <nc_server.h>
+-#include <nc_event.h>
+ 
+ struct msg *
+ rsp_get(struct conn *conn)
+@@ -157,11 +156,9 @@ rsp_filter(struct context *ctx, struct c
+ 
+     pmsg = TAILQ_FIRST(&conn->omsg_q);
+     if (pmsg == NULL) {
+-        log_error("filter stray rsp %"PRIu64" len %"PRIu32" on s %d", msg->id,
+-                  msg->mlen, conn->sd);
++        log_debug(LOG_ERR, "filter stray rsp %"PRIu64" len %"PRIu32" on s %d",
++                  msg->id, msg->mlen, conn->sd);
+         rsp_put(msg);
+-        errno = EINVAL;
+-        conn->err = errno;
+         return true;
+     }
+     ASSERT(pmsg->peer == NULL);
+@@ -222,7 +219,7 @@ rsp_forward(struct context *ctx, struct
+     ASSERT(c_conn->client && !c_conn->proxy);
+ 
+     if (req_done(c_conn, TAILQ_FIRST(&c_conn->omsg_q))) {
+-        status = event_add_out(ctx->ep, c_conn);
++        status = event_add_out(ctx->evb, c_conn);
+         if (status != NC_OK) {
+             c_conn->err = errno;
+         }
+@@ -267,7 +264,7 @@ rsp_send_next(struct context *ctx, struc
+             log_debug(LOG_INFO, "c %d is done", conn->sd);
+         }
+ 
+-        status = event_del_out(ctx->ep, conn);
++        status = event_del_out(ctx->evb, conn);
+         if (status != NC_OK) {
+             conn->err = errno;
+         }
+--- twemproxy-0.2.4.orig/src/nc_core.h
++++ twemproxy-0.2.4/src/nc_core.h
+@@ -40,10 +40,20 @@
+ # define NC_STATS 0
+ #endif
+ 
++#ifdef HAVE_EPOLL
++#define NC_HAVE_EPOLL 1
++#elif HAVE_KQUEUE
++#define NC_HAVE_KQUEUE 1
++#endif
++
+ #ifdef HAVE_LITTLE_ENDIAN
+ # define NC_LITTLE_ENDIAN 1
+ #endif
+ 
++#ifdef HAVE_BACKTRACE
++#define NC_HAVE_BACKTRACE 1
++#endif
++
+ #define NC_OK        0
+ #define NC_ERROR    -1
+ #define NC_EAGAIN   -2
+@@ -65,7 +75,6 @@ struct mbuf;
+ struct mhdr;
+ struct conf;
+ struct stats;
+-struct epoll_event;
+ struct instance;
+ 
+ #include <stddef.h>
+@@ -90,6 +99,7 @@ struct instance;
+ #include <nc_rbtree.h>
+ #include <nc_log.h>
+ #include <nc_util.h>
++#include <event/nc_event.h>
+ #include <nc_stats.h>
+ #include <nc_mbuf.h>
+ #include <nc_message.h>
+@@ -101,14 +111,12 @@ struct context {
+     struct stats       *stats;      /* stats */
+ 
+     struct array       pool;        /* server_pool[] */
+-
+-    int                ep;          /* epoll device */
+-    int                nevent;      /* # epoll event */
++    struct evbase      *evb;
+     int                max_timeout; /* epoll wait max timeout in msec */
+-    int                timeout;     /* epoll wait timeout in msec */
+-    struct epoll_event *event;      /* epoll event */
++    int                timeout;
+ };
+ 
++
+ struct instance {
+     struct context  *ctx;                        /* active context */
+     int             log_level;                   /* log level */
+--- twemproxy-0.2.4.orig/src/nc_core.c
++++ twemproxy-0.2.4/src/nc_core.c
+@@ -17,17 +17,17 @@
+ 
+ #include <stdlib.h>
+ #include <unistd.h>
+-
+-#include <sys/epoll.h>
+-
+ #include <nc_core.h>
+-#include <nc_event.h>
+ #include <nc_conf.h>
+ #include <nc_server.h>
+ #include <nc_proxy.h>
+ 
+ static uint32_t ctx_id; /* context generation */
+ 
++/* function prototype for use in core_ctx_create() */
++static void
++core_core(void *arg, uint32_t evflags);
++
+ static struct context *
+ core_ctx_create(struct instance *nci)
+ {
+@@ -41,12 +41,10 @@ core_ctx_create(struct instance *nci)
+     ctx->id = ++ctx_id;
+     ctx->cf = NULL;
+     ctx->stats = NULL;
++    ctx->evb = NULL;
+     array_null(&ctx->pool);
+-    ctx->ep = -1;
+-    ctx->nevent = EVENT_SIZE_HINT;
+     ctx->max_timeout = nci->stats_interval;
+     ctx->timeout = ctx->max_timeout;
+-    ctx->event = NULL;
+ 
+     /* parse and create configuration */
+     ctx->cf = conf_create(nci->conf_filename);
+@@ -74,8 +72,8 @@ core_ctx_create(struct instance *nci)
+     }
+ 
+     /* initialize event handling for client, proxy and server */
+-    status = event_init(ctx, EVENT_SIZE_HINT);
+-    if (status != NC_OK) {
++    ctx->evb = evbase_create(NC_EVENT_SIZE, &core_core);
++    if (ctx->evb == NULL) {
+         stats_destroy(ctx->stats);
+         server_pool_deinit(&ctx->pool);
+         conf_destroy(ctx->cf);
+@@ -87,7 +85,7 @@ core_ctx_create(struct instance *nci)
+     status = server_pool_preconnect(ctx);
+     if (status != NC_OK) {
+         server_pool_disconnect(ctx);
+-        event_deinit(ctx);
++        evbase_destroy(ctx->evb);
+         stats_destroy(ctx->stats);
+         server_pool_deinit(&ctx->pool);
+         conf_destroy(ctx->cf);
+@@ -99,7 +97,7 @@ core_ctx_create(struct instance *nci)
+     status = proxy_init(ctx);
+     if (status != NC_OK) {
+         server_pool_disconnect(ctx);
+-        event_deinit(ctx);
++        evbase_destroy(ctx->evb);
+         stats_destroy(ctx->stats);
+         server_pool_deinit(&ctx->pool);
+         conf_destroy(ctx->cf);
+@@ -118,7 +116,7 @@ core_ctx_destroy(struct context *ctx)
+     log_debug(LOG_VVERB, "destroy ctx %p id %"PRIu32"", ctx, ctx->id);
+     proxy_deinit(ctx);
+     server_pool_disconnect(ctx);
+-    event_deinit(ctx);
++    evbase_destroy(ctx->evb);
+     stats_destroy(ctx->stats);
+     server_pool_deinit(&ctx->pool);
+     conf_destroy(ctx->cf);
+@@ -206,9 +204,9 @@ core_close(struct context *ctx, struct c
+               conn->eof, conn->done, conn->recv_bytes, conn->send_bytes,
+               conn->err ? ':' : ' ', conn->err ? strerror(conn->err) : "");
+ 
+-    status = event_del_conn(ctx->ep, conn);
++    status = event_del_conn(ctx->evb, conn);
+     if (status < 0) {
+-        log_warn("event del conn e %d %c %d failed, ignored: %s", ctx->ep,
++        log_warn("event del conn %c %d failed, ignored: %s",
+                  type, conn->sd, strerror(errno));
+     }
+ 
+@@ -277,23 +275,33 @@ core_timeout(struct context *ctx)
+ }
+ 
+ static void
+-core_core(struct context *ctx, struct conn *conn, uint32_t events)
++core_core(void *arg, uint32_t evflags)
+ {
+     rstatus_t status;
++    struct conn *conn = (struct conn *) arg;
++    struct context *ctx;
+ 
+-    log_debug(LOG_VVERB, "event %04"PRIX32" on %c %d", events,
++    
++
++    if ((conn->proxy) || (conn->client)) {
++        ctx = ((struct server_pool *) (conn -> owner)) -> ctx;
++    } else { 
++        ctx = ((struct server_pool *) (((struct server *) (conn -> owner)) -> owner )) -> ctx;
++    }
++
++    log_debug(LOG_VVERB, "event %04"PRIX32" on %c %d", evflags,
+               conn->client ? 'c' : (conn->proxy ? 'p' : 's'), conn->sd);
+ 
+-    conn->events = events;
++    conn->events = evflags;
+ 
+     /* error takes precedence over read | write */
+-    if (events & EPOLLERR) {
++    if (evflags & EV_ERR) {
+         core_error(ctx, conn);
+         return;
+     }
+ 
+     /* read takes precedence over write */
+-    if (events & (EPOLLIN | EPOLLHUP)) {
++    if (evflags & EV_READ) {
+         status = core_recv(ctx, conn);
+         if (status != NC_OK || conn->done || conn->err) {
+             core_close(ctx, conn);
+@@ -301,7 +309,7 @@ core_core(struct context *ctx, struct co
+         }
+     }
+ 
+-    if (events & EPOLLOUT) {
++    if (evflags & EV_WRITE) {
+         status = core_send(ctx, conn);
+         if (status != NC_OK || conn->done || conn->err) {
+             core_close(ctx, conn);
+@@ -313,19 +321,13 @@ core_core(struct context *ctx, struct co
+ rstatus_t
+ core_loop(struct context *ctx)
+ {
+-    int i, nsd;
++    int nsd;
+ 
+-    nsd = event_wait(ctx->ep, ctx->event, ctx->nevent, ctx->timeout);
++    nsd = event_wait(ctx->evb, ctx->timeout);
+     if (nsd < 0) {
+         return nsd;
+     }
+ 
+-    for (i = 0; i < nsd; i++) {
+-        struct epoll_event *ev = &ctx->event[i];
+-
+-        core_core(ctx, ev->data.ptr, ev->events);
+-    }
+-
+     core_timeout(ctx);
+ 
+     stats_swap(ctx->stats);
+--- twemproxy-0.2.4.orig/src/nc_queue.h
++++ twemproxy-0.2.4/src/nc_queue.h
+@@ -52,7 +52,9 @@
+ 
+ #include <nc_log.h>
+ 
++#ifndef __offsetof
+ #define __offsetof(type, field) ((size_t)(&((type *)NULL)->field))
++#endif
+ 
+ /*
+  * This file defines five types of data structures: singly-linked lists,
+--- twemproxy-0.2.4.orig/src/nc_request.c
++++ twemproxy-0.2.4/src/nc_request.c
+@@ -17,7 +17,6 @@
+ 
+ #include <nc_core.h>
+ #include <nc_server.h>
+-#include <nc_event.h>
+ 
+ struct msg *
+ req_get(struct conn *conn)
+@@ -413,7 +412,7 @@ req_forward_error(struct context *ctx, s
+     }
+ 
+     if (req_done(conn, TAILQ_FIRST(&conn->omsg_q))) {
+-        status = event_add_out(ctx->ep, conn);
++        status = event_add_out(ctx->evb, conn);
+         if (status != NC_OK) {
+             conn->err = errno;
+         }
+@@ -482,7 +481,7 @@ req_forward(struct context *ctx, struct
+ 
+     /* enqueue the message (request) into server inq */
+     if (TAILQ_EMPTY(&s_conn->imsg_q)) {
+-        status = event_add_out(ctx->ep, s_conn);
++        status = event_add_out(ctx->evb, s_conn);
+         if (status != NC_OK) {
+             req_forward_error(ctx, c_conn, msg);
+             s_conn->err = errno;
+@@ -533,7 +532,7 @@ req_send_next(struct context *ctx, struc
+     nmsg = TAILQ_FIRST(&conn->imsg_q);
+     if (nmsg == NULL) {
+         /* nothing to send as the server inq is empty */
+-        status = event_del_out(ctx->ep, conn);
++        status = event_del_out(ctx->evb, conn);
+         if (status != NC_OK) {
+             conn->err = errno;
+         }
+--- twemproxy-0.2.4.orig/src/nc_util.c
++++ twemproxy-0.2.4/src/nc_util.c
+@@ -22,7 +22,10 @@
+ #include <unistd.h>
+ #include <fcntl.h>
+ #include <netdb.h>
++
++#ifdef NC_HAVE_BACKTRACE
+ #include <execinfo.h>
++#endif
+ 
+ #include <sys/time.h>
+ #include <sys/types.h>
+@@ -275,6 +278,7 @@ _nc_free(void *ptr, const char *name, in
+ void
+ nc_stacktrace(int skip_count)
+ {
++#ifdef NC_HAVE_BACKTRACE
+     void *stack[64];
+     char **symbols;
+     int size, i, j;
+@@ -292,6 +296,7 @@ nc_stacktrace(int skip_count)
+     }
+ 
+     free(symbols);
++#endif
+ }
+ 
+ void
+@@ -617,3 +622,14 @@ nc_unresolve_desc(int sd)
+ 
+     return nc_unresolve_addr(addr, addrlen);
+ }
++
++struct timespec
++nc_millisec_to_timespec (int n_millisec)
++{
++    struct timeval tv = {n_millisec/1000LL, (n_millisec%1000LL)*1000LL};
++    struct timespec ts;
++
++    TIMEVAL_TO_TIMESPEC(&tv, &ts);         
++
++    return ts;
++}
+--- twemproxy-0.2.4.orig/src/nc_util.h
++++ twemproxy-0.2.4/src/nc_util.h
+@@ -190,6 +190,7 @@ int _scnprintf(char *buf, size_t size, c
+ int _vscnprintf(char *buf, size_t size, const char *fmt, va_list args);
+ int64_t nc_usec_now(void);
+ int64_t nc_msec_now(void);
++struct timespec nc_millisec_to_timespec(int millisec);
+ 
+ /*
+  * Address resolution for internet (ipv4 and ipv6) and unix domain
+--- twemproxy-0.2.4.orig/src/nc_server.c
++++ twemproxy-0.2.4/src/nc_server.c
+@@ -19,7 +19,6 @@
+ #include <unistd.h>
+ 
+ #include <nc_core.h>
+-#include <nc_event.h>
+ #include <nc_server.h>
+ #include <nc_conf.h>
+ 
+@@ -367,7 +366,7 @@ server_close(struct context *ctx, struct
+             msg->err = conn->err;
+ 
+             if (req_done(c_conn, TAILQ_FIRST(&c_conn->omsg_q))) {
+-                event_add_out(ctx->ep, msg->owner);
++                event_add_out(ctx->evb, msg->owner);
+             }
+ 
+             log_debug(LOG_INFO, "close s %d schedule error for req %"PRIu64" "
+@@ -397,7 +396,7 @@ server_close(struct context *ctx, struct
+             msg->err = conn->err;
+ 
+             if (req_done(c_conn, TAILQ_FIRST(&c_conn->omsg_q))) {
+-                event_add_out(ctx->ep, msg->owner);
++                event_add_out(ctx->evb, msg->owner);
+             }
+ 
+             log_debug(LOG_INFO, "close s %d schedule error for req %"PRIu64" "
+@@ -476,10 +475,10 @@ server_connect(struct context *ctx, stru
+         }
+     }
+ 
+-    status = event_add_conn(ctx->ep, conn);
++    status = event_add_conn(ctx->evb, conn);
+     if (status != NC_OK) {
+-        log_error("event add conn e %d s %d for server '%.*s' failed: %s",
+-                  ctx->ep, conn->sd, server->pname.len, server->pname.data,
++        log_error("event add conn s %d for server '%.*s' failed: %s",
++                  conn->sd, server->pname.len, server->pname.data,
+                   strerror(errno));
+         goto error;
+     }
+--- twemproxy-0.2.4.orig/src/Makefile.am
++++ twemproxy-0.2.4/src/Makefile.am
+@@ -3,6 +3,7 @@ MAINTAINERCLEANFILES = Makefile.in
+ AM_CPPFLAGS = -D_GNU_SOURCE -D_XOPEN_SOURCE
+ AM_CPPFLAGS += -I $(top_srcdir)/src/hashkit
+ AM_CPPFLAGS += -I $(top_srcdir)/src/proto
++AM_CPPFLAGS += -I $(top_srcdir)/src/event
+ AM_CPPFLAGS += -I $(top_srcdir)/contrib/yaml-0.1.4/include
+ 
+ AM_CFLAGS = -Wall -Wshadow
+@@ -15,9 +16,9 @@ AM_CFLAGS += -Wstrict-prototypes -Wmissi
+ 
+ AM_LDFLAGS = -lm -lpthread -rdynamic
+ 
+-SUBDIRS = hashkit proto
++SUBDIRS = hashkit proto event
+ 
+-bin_PROGRAMS = nutcracker
++sbin_PROGRAMS = nutcracker
+ 
+ nutcracker_SOURCES =			\
+ 	nc_core.c nc_core.h		\
+@@ -29,7 +30,6 @@ nutcracker_SOURCES =			\
+ 	nc_request.c			\
+ 	nc_response.c			\
+ 	nc_mbuf.c nc_mbuf.h		\
+-	nc_event.c nc_event.h		\
+ 	nc_conf.c nc_conf.h		\
+ 	nc_stats.c nc_stats.h		\
+ 	nc_signal.c nc_signal.h		\
+@@ -43,4 +43,5 @@ nutcracker_SOURCES =			\
+ 
+ nutcracker_LDADD = $(top_builddir)/src/hashkit/libhashkit.a
+ nutcracker_LDADD += $(top_builddir)/src/proto/libproto.a
++nutcracker_LDADD += $(top_builddir)/src/event/libevent.a
+ nutcracker_LDADD += $(top_builddir)/contrib/yaml-0.1.4/src/.libs/libyaml.a
+--- twemproxy-0.2.4.orig/src/nc_stats.c
++++ twemproxy-0.2.4/src/nc_stats.c
+@@ -21,7 +21,6 @@
+ 
+ #include <sys/types.h>
+ #include <sys/socket.h>
+-#include <sys/epoll.h>
+ #include <netinet/in.h>
+ 
+ #include <nc_core.h>
+@@ -777,15 +776,7 @@ stats_loop(void *arg)
+     int n;
+ 
+     for (;;) {
+-        n = epoll_wait(st->ep, &st->event, 1, st->interval);
+-        if (n < 0) {
+-            if (errno == EINTR) {
+-                continue;
+-            }
+-            log_error("epoll wait on e %d with event m %d failed: %s",
+-                      st->ep, st->sd, strerror(errno));
+-            break;
+-        }
++        n = event_wait(st->st_evb, st->interval);
+ 
+         /* aggregate stats from shadow (b) -> sum (c) */
+         stats_aggregate(st);
+@@ -847,7 +838,6 @@ static rstatus_t
+ stats_start_aggregator(struct stats *st)
+ {
+     rstatus_t status;
+-    struct epoll_event ev;
+ 
+     if (!stats_enabled) {
+         return NC_OK;
+@@ -858,25 +848,28 @@ stats_start_aggregator(struct stats *st)
+         return status;
+     }
+ 
+-    st->ep = epoll_create(10);
+-    if (st->ep < 0) {
+-        log_error("epoll create failed: %s", strerror(errno));
++    st->st_evb = evbase_create(1, NULL);
++    if (st->st_evb == NULL) {
++        log_error("stats aggregator create failed: %s", strerror(errno));
+         return NC_ERROR;
+     }
+ 
+-    ev.data.fd = st->sd;
+-    ev.events = EPOLLIN;
++    ASSERT(st->st_evb != NULL);
++    ASSERT(st->sd >= 0);
+ 
+-    status = epoll_ctl(st->ep, EPOLL_CTL_ADD, st->sd, &ev);
++    status = event_add_st(st->st_evb, st->sd);
+     if (status < 0) {
+-        log_error("epoll ctl on e %d sd %d failed: %s", st->ep, st->sd,
+-                  strerror(errno));
++        log_error("stats aggregator create failed: %s", strerror(errno));
++        evbase_destroy(st->st_evb);
++        st->st_evb = NULL;
+         return NC_ERROR;
+     }
+ 
+     status = pthread_create(&st->tid, NULL, stats_loop, st);
+     if (status < 0) {
+         log_error("stats aggregator create failed: %s", strerror(status));
++        evbase_destroy(st->st_evb);
++        st->st_evb = NULL;
+         return NC_ERROR;
+     }
+ 
+@@ -891,7 +884,8 @@ stats_stop_aggregator(struct stats *st)
+     }
+ 
+     close(st->sd);
+-    close(st->ep);
++    evbase_destroy(st->st_evb);
++    st->st_evb = NULL;
+ }
+ 
+ struct stats *
+@@ -921,7 +915,7 @@ stats_create(uint16_t stats_port, char *
+     array_null(&st->sum);
+ 
+     st->tid = (pthread_t) -1;
+-    st->ep = -1;
++    st->st_evb = NULL;
+     st->sd = -1;
+ 
+     string_set_text(&st->service_str, "service");
+--- twemproxy-0.2.4.orig/src/nc_stats.h
++++ twemproxy-0.2.4/src/nc_stats.h
+@@ -18,8 +18,6 @@
+ #ifndef _NC_STATS_H_
+ #define _NC_STATS_H_
+ 
+-#include <sys/epoll.h>
+-
+ #include <nc_core.h>
+ 
+ #define STATS_POOL_CODEC(ACTION)                                                                            \
+@@ -101,8 +99,8 @@ struct stats {
+ 
+     pthread_t           tid;            /* stats aggregator thread */
+     int                 sd;             /* stats descriptor */
+-    int                 ep;             /* epoll device */
+-    struct epoll_event  event;          /* epoll event */
++
++    struct evbase       *st_evb;
+ 
+     struct string       service_str;    /* service string */
+     struct string       service;        /* service */
+--- twemproxy-0.2.4.orig/src/nc_proxy.c
++++ twemproxy-0.2.4/src/nc_proxy.c
+@@ -19,7 +19,6 @@
+ 
+ #include <nc_core.h>
+ #include <nc_server.h>
+-#include <nc_event.h>
+ #include <nc_proxy.h>
+ 
+ void
+@@ -163,18 +162,18 @@ proxy_listen(struct context *ctx, struct
+         return NC_ERROR;
+     }
+ 
+-    status = event_add_conn(ctx->ep, p);
++    status = event_add_conn(ctx->evb, p);
+     if (status < 0) {
+-        log_error("event add conn e %d p %d on addr '%.*s' failed: %s",
+-                  ctx->ep, p->sd, pool->addrstr.len, pool->addrstr.data,
++        log_error("event add conn p %d on addr '%.*s' failed: %s",
++                  p->sd, pool->addrstr.len, pool->addrstr.data,
+                   strerror(errno));
+         return NC_ERROR;
+     }
+ 
+-    status = event_del_out(ctx->ep, p);
++    status = event_del_out(ctx->evb, p);
+     if (status < 0) {
+-        log_error("event del out e %d p %d on addr '%.*s' failed: %s",
+-                  ctx->ep, p->sd, pool->addrstr.len, pool->addrstr.data,
++        log_error("event del out p %d on addr '%.*s' failed: %s",
++                  p->sd, pool->addrstr.len, pool->addrstr.data,
+                   strerror(errno));
+         return NC_ERROR;
+     }
+@@ -325,9 +324,9 @@ proxy_accept(struct context *ctx, struct
+         }
+     }
+ 
+-    status = event_add_conn(ctx->ep, c);
++    status = event_add_conn(ctx->evb, c);
+     if (status < 0) {
+-        log_error("event add conn of c %d from p %d failed: %s", c->sd, p->sd,
++        log_error("event add conn from p %d failed: %s", p->sd,
+                   strerror(errno));
+         c->close(ctx, c);
+         return status;
+--- twemproxy-0.2.4.orig/src/proto/nc_redis.c
++++ twemproxy-0.2.4/src/proto/nc_redis.c
+@@ -84,7 +84,6 @@ redis_arg1(struct msg *r)
+     case MSG_REQ_REDIS_GETSET:
+     case MSG_REQ_REDIS_INCRBY:
+     case MSG_REQ_REDIS_INCRBYFLOAT:
+-    case MSG_REQ_REDIS_SET:
+     case MSG_REQ_REDIS_SETNX:
+ 
+     case MSG_REQ_REDIS_HEXISTS:
+@@ -178,6 +177,7 @@ redis_argn(struct msg *r)
+     switch (r->type) {
+     case MSG_REQ_REDIS_BITCOUNT:
+ 
++    case MSG_REQ_REDIS_SET:
+     case MSG_REQ_REDIS_HDEL:
+     case MSG_REQ_REDIS_HMGET:
+     case MSG_REQ_REDIS_HMSET:
+@@ -1538,6 +1538,7 @@ redis_parse_rsp(struct msg *r)
+     struct mbuf *b;
+     uint8_t *p, *m;
+     uint8_t ch;
++
+     enum {
+         SW_START,
+         SW_STATUS,
+@@ -1675,6 +1676,7 @@ redis_parse_rsp(struct msg *r)
+                 r->token = p;
+                 r->rlen = 0;
+             } else if (ch == '-') {
++                /* handles null bulk reply = '$-1' */
+                 state = SW_RUNTO_CRLF;
+             } else if (isdigit(ch)) {
+                 r->rlen = r->rlen * 10 + (uint32_t)(ch - '0');
+@@ -1742,12 +1744,15 @@ redis_parse_rsp(struct msg *r)
+                 /* rsp_start <- p */
+                 r->narg_start = p;
+                 r->rnarg = 0;
++            } else if (ch == '-') {
++                state = SW_RUNTO_CRLF;
+             } else if (isdigit(ch)) {
+                 r->rnarg = r->rnarg * 10 + (uint32_t)(ch - '0');
+             } else if (ch == CR) {
+                 if ((p - r->token) <= 1) {
+                     goto error;
+                 }
++
+                 r->narg = r->rnarg;
+                 r->narg_end = p;
+                 r->token = NULL;
+@@ -1776,7 +1781,16 @@ redis_parse_rsp(struct msg *r)
+ 
+         case SW_MULTIBULK_ARGN_LEN:
+             if (r->token == NULL) {
+-                if (ch != '$') {
++                /*
++                 * From: http://redis.io/topics/protocol, a multi bulk reply
++                 * is used to return an array of other replies. Every element
++                 * of a multi bulk reply can be of any kind, including a
++                 * nested multi bulk reply.
++                 *
++                 * Here, we only handle a multi bulk reply element that
++                 * are either integer reply or bulk reply.
++                 */
++                if (ch != '$' && ch != ':') {
+                     goto error;
+                 }
+                 r->token = p;
+@@ -1790,8 +1804,8 @@ redis_parse_rsp(struct msg *r)
+                     goto error;
+                 }
+ 
+-                if (r->rlen == 1 && (p - r->token) == 3) {
+-                    /* handles not-found reply = '$-1'*/
++                if ((r->rlen == 1 && (p - r->token) == 3) || *r->token == ':') {
++                    /* handles not-found reply = '$-1' or integer reply = ':<num>' */
+                     r->rlen = 0;
+                     state = SW_MULTIBULK_ARGN_LF;
+                 } else {
+--- /dev/null
++++ twemproxy-0.2.4/src/event/nc_event.h
+@@ -0,0 +1,60 @@
++/*
++ * twemproxy - A fast and lightweight proxy for memcached protocol.
++ * Copyright (C) 2011 Twitter, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef _NC_EVENT_H_
++#define _NC_EVENT_H_
++
++#include <nc_core.h>
++
++#define NC_EVENT_SIZE 1024
++
++#define EV_READ     0x0000ff
++#define EV_WRITE    0x00ff00
++#define EV_ERR      0xff0000
++
++#ifdef NC_HAVE_KQUEUE
++struct evbase {
++    int                  kq;
++    struct kevent        *changes;   /* list of changes to be made */
++    struct kevent        *kevents;   /* list of events returned from kevent */
++    int                  n_changes;  /* number of changes in our list */
++    int                  n_returned; /* number of events returned from kevent */
++    int                  n_processed;
++    int                  nevent;
++    void (*callback_fp)(void *, uint32_t);
++};
++#endif
++#ifdef NC_HAVE_EPOLL
++struct evbase {
++    int                   ep;
++    int                   nevent;
++    struct epoll_event    *event;
++    void (*callback_fp)(void *, uint32_t);
++};
++#endif
++
++struct evbase *evbase_create(int size, void (*callback_fp)(void *, uint32_t));
++void evbase_destroy(struct evbase *evb);
++
++int event_add_out(struct evbase *evb, struct conn *c);
++int event_del_out(struct evbase *evb, struct conn *c);
++int event_add_conn(struct evbase *evb, struct conn *c);
++int event_del_conn(struct evbase *evb, struct conn *c);
++int event_wait(struct evbase *evb, int timeout);
++int event_add_st(struct evbase *evb, int fd);
++
++#endif /* _NC_EVENT_H */
+--- /dev/null
++++ twemproxy-0.2.4/src/event/nc_epoll.c
+@@ -0,0 +1,282 @@
++/*
++ * twemproxy - A fast and lightweight proxy for memcached protocol.
++ * Copyright (C) 2011 Twitter, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include <nc_core.h>
++
++#ifdef NC_HAVE_EPOLL
++
++#include <sys/epoll.h>
++
++struct evbase *
++evbase_create(int nevent, void (*callback_fp)(void *, uint32_t))
++{
++    struct evbase *evb;
++    int status, ep;
++    struct epoll_event *event;
++
++    if (nevent <= 0) {
++        log_error("nevent has to be positive %d", nevent);
++        return NULL;
++    }
++
++    ep = epoll_create(nevent);
++    if (ep < 0) {
++        log_error("epoll create of size %d failed: %s", nevent, strerror(errno));
++        return NULL;
++    }
++
++    event = nc_calloc(nevent, sizeof(*event));
++    if (event == NULL) {
++        status = close(ep);
++        if (status < 0) {
++            log_error("close e %d failed, ignored: %s", ep, strerror(errno));
++        }
++        return NULL;
++    }
++
++    evb = nc_alloc(sizeof(*evb));
++    if (evb == NULL) {
++        nc_free(event);
++        status = close(ep);
++        if (status < 0) {
++            log_error("close e %d failed, ignored: %s", ep, strerror(errno));
++        }
++        return NULL;
++
++    }
++
++    evb->nevent = nevent;
++    evb->ep = ep;
++    evb->event = event;
++    evb->callback_fp = callback_fp;
++
++    log_debug(LOG_INFO, "e %d with nevent %d", evb->ep,
++              evb->nevent);
++
++    return evb;
++}
++
++void
++evbase_destroy(struct evbase *evb)
++{
++    int status;
++
++    if (evb == NULL) {
++        return;
++    }
++
++    ASSERT(evb->ep >= 0);
++
++    nc_free(evb->event);
++
++    status = close(evb->ep);
++    if (status < 0) {
++        log_error("close e %d failed, ignored: %s", evb->ep, strerror(errno));
++    }
++    nc_free(evb);
++}
++
++int
++event_add_out(struct evbase *evb, struct conn *c)
++{
++    int status;
++    struct epoll_event event;
++    int ep = evb->ep;
++
++    ASSERT(ep > 0);
++    ASSERT(c != NULL);
++    ASSERT(c->sd > 0);
++    ASSERT(c->recv_active);
++
++    if (c->send_active) {
++        return 0;
++    }
++
++    event.events = (uint32_t)(EPOLLIN | EPOLLOUT | EPOLLET);
++    event.data.ptr = c;
++
++    status = epoll_ctl(ep, EPOLL_CTL_MOD, c->sd, &event);
++    if (status < 0) {
++        log_error("epoll ctl on e %d sd %d failed: %s", ep, c->sd,
++                  strerror(errno));
++    } else {
++        c->send_active = 1;
++    }
++
++    return status;
++}
++
++int
++event_del_out(struct evbase *evb, struct conn *c)
++{
++    int status;
++    struct epoll_event event;
++    int ep = evb->ep;
++
++    ASSERT(ep > 0);
++    ASSERT(c != NULL);
++    ASSERT(c->sd > 0);
++    ASSERT(c->recv_active);
++
++    if (!c->send_active) {
++        return 0;
++    }
++
++    event.events = (uint32_t)(EPOLLIN | EPOLLET);
++    event.data.ptr = c;
++
++    status = epoll_ctl(ep, EPOLL_CTL_MOD, c->sd, &event);
++    if (status < 0) {
++        log_error("epoll ctl on e %d sd %d failed: %s", ep, c->sd,
++                  strerror(errno));
++    } else {
++        c->send_active = 0;
++    }
++
++    return status;
++}
++
++int
++event_add_conn(struct evbase *evb, struct conn *c)
++{
++    int status;
++    struct epoll_event event;
++    int ep = evb->ep;
++
++    ASSERT(ep > 0);
++    ASSERT(c != NULL);
++    ASSERT(c->sd > 0);
++
++    event.events = (uint32_t)(EPOLLIN | EPOLLOUT | EPOLLET);
++    event.data.ptr = c;
++
++    status = epoll_ctl(ep, EPOLL_CTL_ADD, c->sd, &event);
++    if (status < 0) {
++        log_error("epoll ctl on e %d sd %d failed: %s", ep, c->sd,
++                  strerror(errno));
++    } else {
++        c->send_active = 1;
++        c->recv_active = 1;
++    }
++
++    return status;
++}
++
++int
++event_del_conn(struct evbase *evb, struct conn *c)
++{
++    int status;
++    int ep = evb->ep;
++
++    ASSERT(ep > 0);
++    ASSERT(c != NULL);
++    ASSERT(c->sd > 0);
++
++    status = epoll_ctl(ep, EPOLL_CTL_DEL, c->sd, NULL);
++    if (status < 0) {
++        log_error("epoll ctl on e %d sd %d failed: %s", ep, c->sd,
++                  strerror(errno));
++    } else {
++        c->recv_active = 0;
++        c->send_active = 0;
++    }
++
++    return status;
++}
++
++int
++event_wait(struct evbase *evb, int timeout)
++{
++    int nsd, i;
++    uint32_t evflags = 0;
++    int ep = evb->ep;
++    struct epoll_event *event = evb->event;
++    int nevent = evb->nevent;
++    void (*callback_fp)(void *, uint32_t) = evb->callback_fp;
++
++    ASSERT(ep > 0);
++    ASSERT(event != NULL);
++    ASSERT(nevent > 0);
++
++    for (;;) {
++        nsd = epoll_wait(ep, event, nevent, timeout);
++        if (nsd > 0) {
++            for (i = 0; i < nsd; i++) {
++                struct epoll_event *ev = &evb->event[i];
++
++                evflags = 0;
++                if (ev->events & EPOLLERR) {
++                    evflags |= EV_ERR;
++                }
++
++                if (ev->events & EPOLLIN) {
++                    evflags |= EV_READ;
++                }
++
++                if (ev->events & EPOLLOUT) {
++                    evflags |= EV_WRITE;
++                }
++
++                if (callback_fp != NULL) {
++                    (*callback_fp)((void *) ev->data.ptr, evflags);
++                }
++            }
++            return nsd;
++        }
++
++        if (nsd == 0) {
++            if (timeout == -1) {
++               log_error("epoll wait on e %d with %d events and %d timeout "
++                         "returned no events", ep, nevent, timeout);
++                return -1;
++            }
++
++            return 0;
++        }
++
++        if (errno == EINTR) {
++            continue;
++        }
++
++        log_error("epoll wait on e %d with %d events failed: %s", ep, nevent,
++                  strerror(errno));
++
++        return -1;
++    }
++    NOT_REACHED();
++}
++
++int
++event_add_st(struct evbase *evb, int fd)
++{
++    int status;
++    struct epoll_event ev;
++
++    ev.data.fd = fd;
++    ev.events = EPOLLIN;
++
++    status = epoll_ctl(evb->ep, EPOLL_CTL_ADD, fd, &ev);
++    if (status < 0) {
++        log_error("epoll ctl on e %d sd %d failed: %s", evb->ep, fd,
++                  strerror(errno));
++        return status;
++    }
++
++    return status;
++}
++
++#endif /* NC_HAVE_EPOLL */
+--- /dev/null
++++ twemproxy-0.2.4/src/event/nc_kqueue.c
+@@ -0,0 +1,298 @@
++/*
++ * twemproxy - A fast and lightweight proxy for memcached protocol.
++ * Copyright (C) 2011 Twitter, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include <nc_core.h>
++
++#ifdef NC_HAVE_KQUEUE
++
++#include <sys/event.h>
++
++struct evbase *
++evbase_create(int nevent, void (*callback_fp)(void *, uint32_t))
++{
++
++    struct evbase *evb;
++    int status, kq;
++    struct kevent *changes, *kevents;
++
++    if (nevent <= 0) {
++        log_error("nevent has to be positive %d", nevent);
++        return NULL;
++    }
++
++    /* Initialize the kernel queue */
++    if ((kq = kqueue()) == -1) {
++        log_error("kernel queue create failed: %s", kq, strerror(errno));
++        return NULL;
++    }
++
++    changes = nc_calloc(nevent, sizeof(*changes));
++    if (changes == NULL) {
++        status = close(kq);
++        if (status < 0) {
++            log_error("close kq %d failed, ignored: %s", kq, strerror(errno));
++        }
++        return NULL;
++    }
++
++    kevents = nc_calloc(nevent, sizeof(*kevents));
++    if (kevents == NULL) {
++        nc_free(changes);
++        status = close(kq);
++        if (status < 0) {
++            log_error("close kq %d failed, ignored: %s", kq, strerror(errno));
++        }
++        return NULL;
++    }
++
++    evb = (struct evbase *) nc_alloc(sizeof(*evb));
++    if (evb == NULL) {
++        nc_free(changes);
++        nc_free(kevents);
++        status = close(kq);
++        if (status < 0) {
++            log_error("close kq %d failed, ignored: %s", kq, strerror(errno));
++        }
++        return NULL;
++    }
++
++    evb->kq = kq;
++    evb->changes = changes;
++    evb->kevents  = kevents;
++    evb->nevent = nevent;
++    evb->callback_fp = callback_fp;
++    evb->n_changes = 0;
++
++    log_debug(LOG_INFO, "kq %d with nevent %d", evb->kq,
++              evb->nevent);
++
++    return evb;
++}
++
++void
++evbase_destroy(struct evbase *evb)
++{
++    int status;
++
++    if (evb == NULL) return;
++
++    ASSERT(evb->kq >= 0);
++
++    nc_free(evb->changes);
++    nc_free(evb->kevents);
++
++    status = close(evb->kq);
++    if (status < 0) {
++        log_error("close kq %d failed, ignored: %s", evb->kq, strerror(errno));
++    }
++    nc_free(evb);
++}
++
++int
++event_add_out(struct evbase *evb, struct conn *c)
++{
++    struct kevent *event;
++    int kq = evb->kq;
++
++    ASSERT(kq > 0);
++    ASSERT(c != NULL);
++    ASSERT(c->sd > 0);
++    ASSERT(c->recv_active);
++    ASSERT(evb->n_changes < evb->nevent);
++
++    if (c->send_active) {
++        return 0;
++    }
++
++    event = &evb->changes[(evb->n_changes)++];
++    EV_SET(event, c->sd, EVFILT_WRITE, EV_ADD | EV_CLEAR, 0, 0, (void *)c);
++
++    c->send_active = 1;
++
++    return 0;
++}
++
++int
++event_del_out(struct evbase *evb, struct conn *c)
++{
++    struct kevent *event;
++    int kq = evb->kq;
++
++    ASSERT(kq > 0);
++    ASSERT(c != NULL);
++    ASSERT(c->sd > 0);
++    ASSERT(c->recv_active);
++    ASSERT(evb->n_changes < evb->nevent);
++
++    if (!c->send_active) {
++        return 0;
++    }
++
++    event = &evb->changes[(evb->n_changes)++];
++    EV_SET(event, c->sd, EVFILT_WRITE, EV_DELETE, 0, 0, (void *)c);
++
++    c->send_active = 0;
++
++    return 0;
++}
++
++int
++event_add_conn(struct evbase *evb, struct conn *c)
++{
++    struct kevent *event;
++    int kq = evb->kq;
++
++    ASSERT(kq > 0);
++    ASSERT(c != NULL);
++    ASSERT(c->sd > 0);
++    ASSERT(evb->n_changes < evb->nevent);
++
++    event = &evb->changes[(evb->n_changes)++];
++    EV_SET(event, c->sd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, (void *)c);
++
++    c->recv_active = 1;
++
++    event_add_out(evb, c);
++    c->send_active = 1;
++
++    return 0;
++}
++
++int
++event_del_conn(struct evbase *evb, struct conn *c)
++{
++    int i;
++    struct kevent *event;
++    int kq = evb->kq;
++
++    ASSERT(kq > 0);
++    ASSERT(c != NULL);
++    ASSERT(c->sd > 0);
++    ASSERT(evb->n_changes < evb->nevent);
++
++    event = &evb->changes[(evb->n_changes)++];
++    EV_SET(event, c->sd, EVFILT_READ, EV_DELETE, 0, 0, (void *)c);
++
++    event_del_out(evb, c);
++
++    c->recv_active = 0;
++    c->send_active = 0;
++
++    /*
++     * Now, eliminate pending events for c->sd (there should be at most one
++     * other event). This is important because we will close c->sd and free
++     * c when we return.
++     */
++    for (i = evb->n_processed + 1; i < evb->n_returned; i++) {
++        struct kevent *ev = &evb->kevents[i];
++        if (ev->ident == (uintptr_t)c->sd) {
++            ev->flags = 0;
++            ev->filter = 0;
++            break;
++        }
++    }
++
++    return 0;
++}
++
++int
++event_wait(struct evbase *evb, int timeout)
++{
++    int kq = evb->kq;
++    struct timespec ts = nc_millisec_to_timespec(timeout);
++    void (*callback_fp)(void *, uint32_t) = evb->callback_fp;
++
++    ASSERT(kq > 0);
++
++    for (;;) {
++        evb->n_returned = kevent(kq, evb->changes, evb->n_changes, evb->kevents,
++                                 evb->nevent, &ts);
++        evb->n_changes = 0;
++        if (evb->n_returned > 0) {
++            for (evb->n_processed = 0; evb->n_processed < evb->n_returned;
++                evb->n_processed++) {
++                struct kevent *ev = &evb->kevents[evb->n_processed];
++                uint32_t evflags = 0;
++
++                if (ev->flags & EV_ERROR) {
++                   /*
++                    * Error messages that can happen, when a delete fails.
++                    *   EBADF happens when the file descriptor has been
++                    *   closed,
++                    *   ENOENT when the file descriptor was closed and
++                    *   then reopened.
++                    *   EINVAL for some reasons not understood; EINVAL
++                    *   should not be returned ever; but FreeBSD does :-\
++                    * An error is also indicated when a callback deletes
++                    * an event we are still processing.  In that case
++                    * the data field is set to ENOENT.
++                    */
++                    if (ev->data == EBADF || ev->data == EINVAL ||
++                        ev->data == ENOENT) {
++                        continue;
++                    }
++                    evflags |= EV_ERR;
++                }
++
++                if (ev->filter == EVFILT_READ) {
++                    evflags |= EV_READ;
++                }
++
++                if (ev->filter == EVFILT_WRITE) {
++                    evflags |= EV_WRITE;
++                }
++
++                if (callback_fp != NULL && evflags != 0) {
++                    (*callback_fp)((void *)(ev->udata), evflags);
++                }
++            }
++            return evb->n_returned;
++        }
++
++        if (evb->n_returned == 0) {
++            if (timeout == -1) {
++               log_error("kqueue on kq %d with %d events and %d timeout "
++                         "returned no events", kq, evb->nevent, timeout);
++                return -1;
++            }
++
++            return 0;
++        }
++
++        if (errno == EINTR) {
++            continue;
++        }
++
++        log_error("kevent on kq %d with %d events failed: %s", kq, evb->nevent,
++                  strerror(errno));
++
++        return -1;
++    }
++    NOT_REACHED();
++}
++
++int
++event_add_st(struct evbase *evb, int fd)
++{
++    struct kevent *ev = &evb->changes[(evb->n_changes)++];
++
++    EV_SET(ev, fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, NULL);
++
++    return 0;
++}
++
++#endif /* NC_HAVE_KQUEUE */
+--- /dev/null
++++ twemproxy-0.2.4/src/event/Makefile.am
+@@ -0,0 +1,14 @@
++MAINTAINERCLEANFILES = Makefile.in
++
++AM_CPPFLAGS = -I $(top_srcdir)/src
++
++AM_CFLAGS = -Wall -Wshadow
++AM_CFLAGS += -Wno-unused-parameter -Wno-unused-value
++
++noinst_LIBRARIES = libevent.a
++
++noinst_HEADERS = nc_event.h
++
++libevent_a_SOURCES =		\
++	nc_epoll.c		\
++	nc_kqueue.c
+--- twemproxy-0.2.4.orig/src/hashkit/nc_md5.c
++++ twemproxy-0.2.4/src/hashkit/nc_md5.c
+@@ -15,365 +15,307 @@
+  * limitations under the License.
+  */
+ 
++#include <nc_core.h>
++
+ /*
+- * This Library has been modified from its original form by
+- * Brian Aker (brian@tangent.org)
+- *
+- * See below for original Copyright.
+- */
+-/* MD5C.C - RSA Data Security, Inc., MD5 message-digest algorithm
+- *
+- * Copyright (C) 1991-2, RSA Data Security, Inc. Created 1991. All
+- * rights reserved.
+- *
+- * License to copy and use this software is granted provided that it
+- * is identified as the "RSA Data Security, Inc. MD5 Message-Digest
+- * Algorithm" in all material mentioning or referencing this software
+- * or this function.
++ * This is an OpenSSL-compatible implementation of the RSA Data Security, Inc.
++ * MD5 Message-Digest Algorithm (RFC 1321).
+  *
+- * License is also granted to make and use derivative works provided
+- * that such works are identified as "derived from the RSA Data
+- * Security, Inc. MD5 Message-Digest Algorithm" in all material
+- * mentioning or referencing the derived work.
++ * Homepage: http://openwall.info/wiki/people/solar/software/public-domain-source-code/md5
+  *
+- * RSA Data Security, Inc. makes no representations concerning either
+- * the merchantability of this software or the suitability of this
+- * software for any particular purpose. It is provided "as is"
+- * without express or implied warranty of any kind.
+- *
+- * These notices must be retained in any copies of any part of this
+- * documentation and/or software.
++ * Author: Alexander Peslyak, better known as Solar Designer <solar at openwall.com>
+  */
+ 
+-#include <nc_core.h>
+-
+-/* POINTER defines a generic pointer type */
+-typedef unsigned char *POINTER;
+-
+-
+-/* UINT4 defines a four byte word */
+-typedef unsigned int UINT4;
++#include <string.h>
+ 
++typedef unsigned int MD5_u32plus;
+ 
+-/* MD5 context. */
+ typedef struct {
+-  UINT4 state[4];                                   /* state (ABCD) */
+-  UINT4 count[2];        /* number of bits, modulo 2^64 (lsb first) */
+-  unsigned char buffer[64];                         /* input buffer */
++    MD5_u32plus lo, hi;
++    MD5_u32plus a, b, c, d;
++    unsigned char buffer[64];
++    MD5_u32plus block[16];
+ } MD5_CTX;
+ 
+-static void MD5Init (MD5_CTX *context);      /* context */
+-static void MD5Update ( MD5_CTX *context,                                        /* context */
+-                        const unsigned char *input,                              /* input block */
+-                        unsigned int inputLen);                     /* length of input block */
+-static void MD5Final ( unsigned char digest[16],                         /* message digest */
+-                       MD5_CTX *context);                              /* context */
+-
+-/* Constants for MD5Transform routine. */
+-
+-#define S11 7
+-#define S12 12
+-#define S13 17
+-#define S14 22
+-#define S21 5
+-#define S22 9
+-#define S23 14
+-#define S24 20
+-#define S31 4
+-#define S32 11
+-#define S33 16
+-#define S34 23
+-#define S41 6
+-#define S42 10
+-#define S43 15
+-#define S44 21
+-
+-
+-static void MD5Transform (UINT4 state[4],
+-                          unsigned char block[64]);
+-static void Encode (unsigned char *output,
+-                    UINT4 *input,
+-                    unsigned int len);
+-static void Decode(UINT4 *output, unsigned char *input, unsigned int len);
+-
+-static unsigned char PADDING[64] = {
+-  0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+-  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+-  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+-};
++/*
++ * The basic MD5 functions.
++ *
++ * F and G are optimized compared to their RFC 1321 definitions for
++ * architectures that lack an AND-NOT instruction, just like in Colin Plumb's
++ * implementation.
++ */
++#define F(x, y, z)			((z) ^ ((x) & ((y) ^ (z))))
++#define G(x, y, z)			((y) ^ ((z) & ((x) ^ (y))))
++#define H(x, y, z)			((x) ^ (y) ^ (z))
++#define I(x, y, z)			((y) ^ ((x) | ~(z)))
+ 
+-/* F, G, H and I are basic MD5 functions.
++/*
++ * The MD5 transformation for all four rounds.
+  */
+-#define F(x, y, z) (((x) & (y)) | ((~x) & (z)))
+-#define G(x, y, z) (((x) & (z)) | ((y) & (~z)))
+-#define H(x, y, z) ((x) ^ (y) ^ (z))
+-#define I(x, y, z) ((y) ^ ((x) | (~z)))
++#define STEP(f, a, b, c, d, x, t, s)                            \
++	(a) += f((b), (c), (d)) + (x) + (t);                        \
++	(a) = (((a) << (s)) | (((a) & 0xffffffff) >> (32 - (s))));  \
++	(a) += (b);
+ 
+-/* ROTATE_LEFT rotates x left n bits.
+- */
+-#define ROTATE_LEFT(x, n) (((x) << (n)) | ((x) >> (32-(n))))
++/*
++ * SET reads 4 input bytes in little-endian byte order and stores them
++ * in a properly aligned word in host byte order.
++ *
++ * The check for little-endian architectures that tolerate unaligned
++ * memory accesses is just an optimization.  Nothing will break if it
++ * doesn't work.
++ */
++#if defined(__i386__) || defined(__x86_64__) || defined(__vax__)
++#define SET(n) \
++    (*(MD5_u32plus *)&ptr[(n) * 4])
++#define GET(n) \
++    SET(n)
++#else
++#define SET(n)                                  \
++    (ctx->block[(n)] =                          \
++    (MD5_u32plus)ptr[(n) * 4] |                 \
++    ((MD5_u32plus)ptr[(n) * 4 + 1] << 8) |      \
++    ((MD5_u32plus)ptr[(n) * 4 + 2] << 16) |     \
++    ((MD5_u32plus)ptr[(n) * 4 + 3] << 24))
++#define GET(n) \
++    (ctx->block[(n)])
++#endif
+ 
+-/* FF, GG, HH, and II transformations for rounds 1, 2, 3, and 4.
+-Rotation is separate from addition to prevent recomputation.
++/*
++ * This processes one or more 64-byte data blocks, but does NOT update
++ * the bit counters.  There are no alignment requirements.
+  */
+-#define FF(a, b, c, d, x, s, ac) { \
+- (a) += F ((b), (c), (d)) + (x) + (UINT4)(ac); \
+- (a) = ROTATE_LEFT ((a), (s)); \
+- (a) += (b); \
+-  }
+-#define GG(a, b, c, d, x, s, ac) { \
+- (a) += G ((b), (c), (d)) + (x) + (UINT4)(ac); \
+- (a) = ROTATE_LEFT ((a), (s)); \
+- (a) += (b); \
+-  }
+-#define HH(a, b, c, d, x, s, ac) { \
+- (a) += H ((b), (c), (d)) + (x) + (UINT4)(ac); \
+- (a) = ROTATE_LEFT ((a), (s)); \
+- (a) += (b); \
+-  }
+-#define II(a, b, c, d, x, s, ac) { \
+- (a) += I ((b), (c), (d)) + (x) + (UINT4)(ac); \
+- (a) = ROTATE_LEFT ((a), (s)); \
+- (a) += (b); \
+-  }
+-
+-
+-/* 
+-  Just a simple method for getting the signature
+-  result must be == 16
+-*/
+-void md5_signature(const unsigned char *key, unsigned int length, unsigned char *result)
++static void *
++body(MD5_CTX *ctx, void *data, unsigned long size)
+ {
+-    MD5_CTX my_md5;
+-
+-    MD5Init(&my_md5);
+-    (void)MD5Update(&my_md5, key, length);
+-    MD5Final(result, &my_md5);
+-}
++    unsigned char *ptr;
++    MD5_u32plus a, b, c, d;
++    MD5_u32plus saved_a, saved_b, saved_c, saved_d;
++
++    ptr = data;
++
++    a = ctx->a;
++    b = ctx->b;
++    c = ctx->c;
++    d = ctx->d;
++
++	do {
++        saved_a = a;
++        saved_b = b;
++        saved_c = c;
++        saved_d = d;
++
++        /* Round 1 */
++        STEP(F, a, b, c, d, SET(0), 0xd76aa478, 7)
++        STEP(F, d, a, b, c, SET(1), 0xe8c7b756, 12)
++        STEP(F, c, d, a, b, SET(2), 0x242070db, 17)
++        STEP(F, b, c, d, a, SET(3), 0xc1bdceee, 22)
++        STEP(F, a, b, c, d, SET(4), 0xf57c0faf, 7)
++        STEP(F, d, a, b, c, SET(5), 0x4787c62a, 12)
++        STEP(F, c, d, a, b, SET(6), 0xa8304613, 17)
++        STEP(F, b, c, d, a, SET(7), 0xfd469501, 22)
++        STEP(F, a, b, c, d, SET(8), 0x698098d8, 7)
++        STEP(F, d, a, b, c, SET(9), 0x8b44f7af, 12)
++        STEP(F, c, d, a, b, SET(10), 0xffff5bb1, 17)
++        STEP(F, b, c, d, a, SET(11), 0x895cd7be, 22)
++        STEP(F, a, b, c, d, SET(12), 0x6b901122, 7)
++        STEP(F, d, a, b, c, SET(13), 0xfd987193, 12)
++        STEP(F, c, d, a, b, SET(14), 0xa679438e, 17)
++        STEP(F, b, c, d, a, SET(15), 0x49b40821, 22)
++
++        /* Round 2 */
++        STEP(G, a, b, c, d, GET(1), 0xf61e2562, 5)
++        STEP(G, d, a, b, c, GET(6), 0xc040b340, 9)
++        STEP(G, c, d, a, b, GET(11), 0x265e5a51, 14)
++        STEP(G, b, c, d, a, GET(0), 0xe9b6c7aa, 20)
++        STEP(G, a, b, c, d, GET(5), 0xd62f105d, 5)
++        STEP(G, d, a, b, c, GET(10), 0x02441453, 9)
++        STEP(G, c, d, a, b, GET(15), 0xd8a1e681, 14)
++        STEP(G, b, c, d, a, GET(4), 0xe7d3fbc8, 20)
++        STEP(G, a, b, c, d, GET(9), 0x21e1cde6, 5)
++        STEP(G, d, a, b, c, GET(14), 0xc33707d6, 9)
++        STEP(G, c, d, a, b, GET(3), 0xf4d50d87, 14)
++        STEP(G, b, c, d, a, GET(8), 0x455a14ed, 20)
++        STEP(G, a, b, c, d, GET(13), 0xa9e3e905, 5)
++        STEP(G, d, a, b, c, GET(2), 0xfcefa3f8, 9)
++        STEP(G, c, d, a, b, GET(7), 0x676f02d9, 14)
++        STEP(G, b, c, d, a, GET(12), 0x8d2a4c8a, 20)
++
++        /* Round 3 */
++        STEP(H, a, b, c, d, GET(5), 0xfffa3942, 4)
++        STEP(H, d, a, b, c, GET(8), 0x8771f681, 11)
++        STEP(H, c, d, a, b, GET(11), 0x6d9d6122, 16)
++        STEP(H, b, c, d, a, GET(14), 0xfde5380c, 23)
++        STEP(H, a, b, c, d, GET(1), 0xa4beea44, 4)
++        STEP(H, d, a, b, c, GET(4), 0x4bdecfa9, 11)
++        STEP(H, c, d, a, b, GET(7), 0xf6bb4b60, 16)
++        STEP(H, b, c, d, a, GET(10), 0xbebfbc70, 23)
++        STEP(H, a, b, c, d, GET(13), 0x289b7ec6, 4)
++        STEP(H, d, a, b, c, GET(0), 0xeaa127fa, 11)
++        STEP(H, c, d, a, b, GET(3), 0xd4ef3085, 16)
++        STEP(H, b, c, d, a, GET(6), 0x04881d05, 23)
++        STEP(H, a, b, c, d, GET(9), 0xd9d4d039, 4)
++        STEP(H, d, a, b, c, GET(12), 0xe6db99e5, 11)
++        STEP(H, c, d, a, b, GET(15), 0x1fa27cf8, 16)
++        STEP(H, b, c, d, a, GET(2), 0xc4ac5665, 23)
++
++        /* Round 4 */
++        STEP(I, a, b, c, d, GET(0), 0xf4292244, 6)
++        STEP(I, d, a, b, c, GET(7), 0x432aff97, 10)
++        STEP(I, c, d, a, b, GET(14), 0xab9423a7, 15)
++        STEP(I, b, c, d, a, GET(5), 0xfc93a039, 21)
++        STEP(I, a, b, c, d, GET(12), 0x655b59c3, 6)
++        STEP(I, d, a, b, c, GET(3), 0x8f0ccc92, 10)
++        STEP(I, c, d, a, b, GET(10), 0xffeff47d, 15)
++        STEP(I, b, c, d, a, GET(1), 0x85845dd1, 21)
++        STEP(I, a, b, c, d, GET(8), 0x6fa87e4f, 6)
++        STEP(I, d, a, b, c, GET(15), 0xfe2ce6e0, 10)
++        STEP(I, c, d, a, b, GET(6), 0xa3014314, 15)
++        STEP(I, b, c, d, a, GET(13), 0x4e0811a1, 21)
++        STEP(I, a, b, c, d, GET(4), 0xf7537e82, 6)
++        STEP(I, d, a, b, c, GET(11), 0xbd3af235, 10)
++        STEP(I, c, d, a, b, GET(2), 0x2ad7d2bb, 15)
++        STEP(I, b, c, d, a, GET(9), 0xeb86d391, 21)
++
++        a += saved_a;
++        b += saved_b;
++        c += saved_c;
++        d += saved_d;
++
++        ptr += 64;
++    } while (size -= 64);
++
++    ctx->a = a;
++    ctx->b = b;
++    ctx->c = c;
++    ctx->d = d;
+ 
+-/* MD5 initialization. Begins an MD5 operation, writing a new context.
+- */
+-static void MD5Init (MD5_CTX *context)      /* context */
+-{
+-  context->count[0] = context->count[1] = 0;
+-  /* Load magic initialization constants.
+-*/
+-  context->state[0] = 0x67452301;
+-  context->state[1] = 0xefcdab89;
+-  context->state[2] = 0x98badcfe;
+-  context->state[3] = 0x10325476;
++    return ptr;
+ }
+ 
+-/* MD5 block update operation. Continues an MD5 message-digest
+-  operation, processing another message block, and updating the
+-  context.
+- */
+-
+-static void MD5Update (
+-                       MD5_CTX *context,                                        /* context */
+-                       const unsigned char *input,                              /* input block */
+-                       unsigned int inputLen)                     /* length of input block */
++void
++MD5_Init(MD5_CTX *ctx)
+ {
+-  unsigned int i, idx, partLen;
+-
+-  /* Compute number of bytes mod 64 */
+-  idx = (unsigned int)((context->count[0] >> 3) & 0x3F);
+-
+-
+-  /* Update number of bits */
+-  if ((context->count[0] += ((UINT4)inputLen << 3))
+-      < ((UINT4)inputLen << 3))
+-    context->count[1]++;
+-  context->count[1] += ((UINT4)inputLen >> 29);
+-
+-  partLen = 64 - idx;
+-
+-  /* Transform as many times as possible.
+-*/
+-  if (inputLen >= partLen) {
+- memcpy((POINTER)&context->buffer[idx], (POINTER)input, partLen);
+- MD5Transform(context->state, context->buffer);
+-
+- for (i = partLen; i + 63 < inputLen; i += 64)
+-   MD5Transform (context->state, (unsigned char *)&input[i]);
+-
+- idx = 0;
+-  }
+-  else
+- i = 0;
++    ctx->a = 0x67452301;
++    ctx->b = 0xefcdab89;
++    ctx->c = 0x98badcfe;
++    ctx->d = 0x10325476;
+ 
+-  /* Buffer remaining input */
+-  memcpy((POINTER)&context->buffer[idx], (POINTER)&input[i],
+-	     inputLen-i);
++    ctx->lo = 0;
++    ctx->hi = 0;
+ }
+ 
+-/* MD5 finalization. Ends an MD5 message-digest operation, writing the
+-  the message digest and zeroizing the context.
+- */
+-
+-static void MD5Final (
+-                      unsigned char digest[16],                         /* message digest */
+-                      MD5_CTX *context)                              /* context */
++void
++MD5_Update(MD5_CTX *ctx, void *data, unsigned long size)
+ {
+-  unsigned char bits[8];
+-  unsigned int idx, padLen;
++    MD5_u32plus saved_lo;
++    unsigned long used, free;
+ 
+-  /* Save number of bits */
+-  Encode (bits, context->count, 8);
++    saved_lo = ctx->lo;
++    if ((ctx->lo = (saved_lo + size) & 0x1fffffff) < saved_lo) {
++        ctx->hi++;
++    }
++    ctx->hi += size >> 29;
++
++    used = saved_lo & 0x3f;
++
++    if (used) {
++        free = 64 - used;
++
++        if (size < free) {
++            memcpy(&ctx->buffer[used], data, size);
++            return;
++        }
++
++        memcpy(&ctx->buffer[used], data, free);
++        data = (unsigned char *)data + free;
++        size -= free;
++        body(ctx, ctx->buffer, 64);
++    }
++
++    if (size >= 64) {
++        data = body(ctx, data, size & ~(unsigned long)0x3f);
++        size &= 0x3f;
++    }
+ 
+-  /* Pad out to 56 mod 64.
+-*/
+-  idx = (unsigned int)((context->count[0] >> 3) & 0x3f);
+-  padLen = (idx < 56) ? (56 - idx) : (120 - idx);
+-  MD5Update (context, PADDING, padLen);
+-
+-  /* Append length (before padding) */
+-  MD5Update (context, bits, 8);
+-
+-  /* Store state in digest */
+-  Encode (digest, context->state, 16);
+-
+-  /* Zeroize sensitive information.
+-*/
+-  memset((POINTER)context, 0, sizeof (*context));
++    memcpy(ctx->buffer, data, size);
+ }
+ 
+-/* MD5 basic transformation. Transforms state based on block.
+- */
+-static void MD5Transform (
+-                          UINT4 state[4],
+-                          unsigned char block[64])
++void
++MD5_Final(unsigned char *result, MD5_CTX *ctx)
+ {
+-  UINT4 a = state[0], b = state[1], c = state[2], d = state[3], x[16];
++    unsigned long used, free;
+ 
+-  Decode (x, block, 64);
++    used = ctx->lo & 0x3f;
+ 
+-  /* Round 1 */
+-  FF (a, b, c, d, x[ 0], S11, 0xd76aa478); /* 1 */
+-  FF (d, a, b, c, x[ 1], S12, 0xe8c7b756); /* 2 */
+-  FF (c, d, a, b, x[ 2], S13, 0x242070db); /* 3 */
+-  FF (b, c, d, a, x[ 3], S14, 0xc1bdceee); /* 4 */
+-  FF (a, b, c, d, x[ 4], S11, 0xf57c0faf); /* 5 */
+-  FF (d, a, b, c, x[ 5], S12, 0x4787c62a); /* 6 */
+-  FF (c, d, a, b, x[ 6], S13, 0xa8304613); /* 7 */
+-  FF (b, c, d, a, x[ 7], S14, 0xfd469501); /* 8 */
+-  FF (a, b, c, d, x[ 8], S11, 0x698098d8); /* 9 */
+-  FF (d, a, b, c, x[ 9], S12, 0x8b44f7af); /* 10 */
+-  FF (c, d, a, b, x[10], S13, 0xffff5bb1); /* 11 */
+-  FF (b, c, d, a, x[11], S14, 0x895cd7be); /* 12 */
+-  FF (a, b, c, d, x[12], S11, 0x6b901122); /* 13 */
+-  FF (d, a, b, c, x[13], S12, 0xfd987193); /* 14 */
+-  FF (c, d, a, b, x[14], S13, 0xa679438e); /* 15 */
+-  FF (b, c, d, a, x[15], S14, 0x49b40821); /* 16 */
+-
+- /* Round 2 */
+-  GG (a, b, c, d, x[ 1], S21, 0xf61e2562); /* 17 */
+-  GG (d, a, b, c, x[ 6], S22, 0xc040b340); /* 18 */
+-  GG (c, d, a, b, x[11], S23, 0x265e5a51); /* 19 */
+-  GG (b, c, d, a, x[ 0], S24, 0xe9b6c7aa); /* 20 */
+-  GG (a, b, c, d, x[ 5], S21, 0xd62f105d); /* 21 */
+-  GG (d, a, b, c, x[10], S22,  0x2441453); /* 22 */
+-  GG (c, d, a, b, x[15], S23, 0xd8a1e681); /* 23 */
+-  GG (b, c, d, a, x[ 4], S24, 0xe7d3fbc8); /* 24 */
+-  GG (a, b, c, d, x[ 9], S21, 0x21e1cde6); /* 25 */
+-  GG (d, a, b, c, x[14], S22, 0xc33707d6); /* 26 */
+-  GG (c, d, a, b, x[ 3], S23, 0xf4d50d87); /* 27 */
+-  GG (b, c, d, a, x[ 8], S24, 0x455a14ed); /* 28 */
+-  GG (a, b, c, d, x[13], S21, 0xa9e3e905); /* 29 */
+-  GG (d, a, b, c, x[ 2], S22, 0xfcefa3f8); /* 30 */
+-  GG (c, d, a, b, x[ 7], S23, 0x676f02d9); /* 31 */
+-  GG (b, c, d, a, x[12], S24, 0x8d2a4c8a); /* 32 */
+-
+-  /* Round 3 */
+-  HH (a, b, c, d, x[ 5], S31, 0xfffa3942); /* 33 */
+-  HH (d, a, b, c, x[ 8], S32, 0x8771f681); /* 34 */
+-  HH (c, d, a, b, x[11], S33, 0x6d9d6122); /* 35 */
+-  HH (b, c, d, a, x[14], S34, 0xfde5380c); /* 36 */
+-  HH (a, b, c, d, x[ 1], S31, 0xa4beea44); /* 37 */
+-  HH (d, a, b, c, x[ 4], S32, 0x4bdecfa9); /* 38 */
+-  HH (c, d, a, b, x[ 7], S33, 0xf6bb4b60); /* 39 */
+-  HH (b, c, d, a, x[10], S34, 0xbebfbc70); /* 40 */
+-  HH (a, b, c, d, x[13], S31, 0x289b7ec6); /* 41 */
+-  HH (d, a, b, c, x[ 0], S32, 0xeaa127fa); /* 42 */
+-  HH (c, d, a, b, x[ 3], S33, 0xd4ef3085); /* 43 */
+-  HH (b, c, d, a, x[ 6], S34,  0x4881d05); /* 44 */
+-  HH (a, b, c, d, x[ 9], S31, 0xd9d4d039); /* 45 */
+-  HH (d, a, b, c, x[12], S32, 0xe6db99e5); /* 46 */
+-  HH (c, d, a, b, x[15], S33, 0x1fa27cf8); /* 47 */
+-  HH (b, c, d, a, x[ 2], S34, 0xc4ac5665); /* 48 */
+-
+-  /* Round 4 */
+-  II (a, b, c, d, x[ 0], S41, 0xf4292244); /* 49 */
+-  II (d, a, b, c, x[ 7], S42, 0x432aff97); /* 50 */
+-  II (c, d, a, b, x[14], S43, 0xab9423a7); /* 51 */
+-  II (b, c, d, a, x[ 5], S44, 0xfc93a039); /* 52 */
+-  II (a, b, c, d, x[12], S41, 0x655b59c3); /* 53 */
+-  II (d, a, b, c, x[ 3], S42, 0x8f0ccc92); /* 54 */
+-  II (c, d, a, b, x[10], S43, 0xffeff47d); /* 55 */
+-  II (b, c, d, a, x[ 1], S44, 0x85845dd1); /* 56 */
+-  II (a, b, c, d, x[ 8], S41, 0x6fa87e4f); /* 57 */
+-  II (d, a, b, c, x[15], S42, 0xfe2ce6e0); /* 58 */
+-  II (c, d, a, b, x[ 6], S43, 0xa3014314); /* 59 */
+-  II (b, c, d, a, x[13], S44, 0x4e0811a1); /* 60 */
+-  II (a, b, c, d, x[ 4], S41, 0xf7537e82); /* 61 */
+-  II (d, a, b, c, x[11], S42, 0xbd3af235); /* 62 */
+-  II (c, d, a, b, x[ 2], S43, 0x2ad7d2bb); /* 63 */
+-  II (b, c, d, a, x[ 9], S44, 0xeb86d391); /* 64 */
+-
+-
+-  state[0] += a;
+-  state[1] += b;
+-  state[2] += c;
+-  state[3] += d;
+-
+-  /* Zeroize sensitive information.
+-*/
+-  memset((POINTER)x, 0, sizeof (x));
+-}
++    ctx->buffer[used++] = 0x80;
+ 
+-/* Encodes input (UINT4) into output (unsigned char). Assumes len is
+-  a multiple of 4.
+- */
+-static void Encode (
+-unsigned char *output,
+-UINT4 *input,
+-unsigned int len)
+-{
+-  unsigned int i, j;
++    free = 64 - used;
+ 
+-  for (i = 0, j = 0; j < len; i++, j += 4) {
+-    output[j] = (unsigned char)(input[i] & 0xff);
+-    output[j+1] = (unsigned char)((input[i] >> 8) & 0xff);
+-    output[j+2] = (unsigned char)((input[i] >> 16) & 0xff);
+-    output[j+3] = (unsigned char)((input[i] >> 24) & 0xff);
+-  }
+-}
++    if (free < 8) {
++        memset(&ctx->buffer[used], 0, free);
++        body(ctx, ctx->buffer, 64);
++        used = 0;
++        free = 64;
++    }
++
++    memset(&ctx->buffer[used], 0, free - 8);
++
++    ctx->lo <<= 3;
++    ctx->buffer[56] = ctx->lo;
++    ctx->buffer[57] = ctx->lo >> 8;
++    ctx->buffer[58] = ctx->lo >> 16;
++    ctx->buffer[59] = ctx->lo >> 24;
++    ctx->buffer[60] = ctx->hi;
++    ctx->buffer[61] = ctx->hi >> 8;
++    ctx->buffer[62] = ctx->hi >> 16;
++    ctx->buffer[63] = ctx->hi >> 24;
++
++    body(ctx, ctx->buffer, 64);
++
++    result[0] = ctx->a;
++    result[1] = ctx->a >> 8;
++    result[2] = ctx->a >> 16;
++    result[3] = ctx->a >> 24;
++    result[4] = ctx->b;
++    result[5] = ctx->b >> 8;
++    result[6] = ctx->b >> 16;
++    result[7] = ctx->b >> 24;
++    result[8] = ctx->c;
++    result[9] = ctx->c >> 8;
++    result[10] = ctx->c >> 16;
++    result[11] = ctx->c >> 24;
++    result[12] = ctx->d;
++    result[13] = ctx->d >> 8;
++    result[14] = ctx->d >> 16;
++    result[15] = ctx->d >> 24;
+ 
++    memset(ctx, 0, sizeof(*ctx));
++}
+ 
+-/* Decodes input (unsigned char) into output (UINT4). Assumes len is
+-  a multiple of 4.
++/*
++ * Just a simple method for getting the signature
++ * result must be == 16
+  */
+-static void Decode (
+-UINT4 *output,
+-unsigned char *input,
+-unsigned int len)
++void
++md5_signature(unsigned char *key, unsigned long length, unsigned char *result)
+ {
+-  unsigned int i, j;
++    MD5_CTX my_md5;
+ 
+-  for (i = 0, j = 0; j < len; i++, j += 4)
+- output[i] = ((UINT4)input[j]) | (((UINT4)input[j+1]) << 8) |
+-   (((UINT4)input[j+2]) << 16) | (((UINT4)input[j+3]) << 24);
++    MD5_Init(&my_md5);
++    (void)MD5_Update(&my_md5, key, length);
++    MD5_Final(result, &my_md5);
+ }
+ 
+ uint32_t
+ hash_md5(const char *key, size_t key_length)
+ {
+-  unsigned char results[16];
++    unsigned char results[16];
+ 
+-  md5_signature((unsigned char*)key, (unsigned int)key_length, results);
++    md5_signature((unsigned char*)key, (unsigned long)key_length, results);
+ 
+-  return ((uint32_t) (results[3] & 0xFF) << 24)
+-    | ((uint32_t) (results[2] & 0xFF) << 16)
+-    | ((uint32_t) (results[1] & 0xFF) << 8)
+-    | (results[0] & 0xFF);
++    return ((uint32_t) (results[3] & 0xFF) << 24) |
++           ((uint32_t) (results[2] & 0xFF) << 16) |
++           ((uint32_t) (results[1] & 0xFF) << 8) |
++           (results[0] & 0xFF);
+ }
+--- twemproxy-0.2.4.orig/src/hashkit/nc_crc32.c
++++ twemproxy-0.2.4/src/hashkit/nc_crc32.c
+@@ -91,15 +91,33 @@ static const uint32_t crc32tab[256] = {
+     0xb40bbe37, 0xc30c8ea1, 0x5a05df1b, 0x2d02ef8d,
+ };
+ 
++/*
++ * CRC-32 implementation compatible with libmemcached library. Unfortunately
++ * this implementation does not return CRC-32 as per spec.
++ */
+ uint32_t
+ hash_crc32(const char *key, size_t key_length)
+ {
+     uint64_t x;
+     uint32_t crc = UINT32_MAX;
+ 
+-    for (x= 0; x < key_length; x++) {
++    for (x = 0; x < key_length; x++) {
+         crc = (crc >> 8) ^ crc32tab[(crc ^ (uint64_t)key[x]) & 0xff];
+     }
+ 
+     return ((~crc) >> 16) & 0x7fff;
+ }
++
++uint32_t
++hash_crc32a(const char *key, size_t key_length)
++{
++    const uint8_t *p = key;
++    uint32_t crc;
++
++    crc = ~0U;
++    while (key_length--) {
++        crc = crc32tab[(crc ^ *p++) & 0xFF] ^ (crc >> 8);
++    }
++
++    return crc ^ ~0U;
++}
+--- twemproxy-0.2.4.orig/src/hashkit/nc_hashkit.h
++++ twemproxy-0.2.4/src/hashkit/nc_hashkit.h
+@@ -26,6 +26,7 @@
+     ACTION( HASH_MD5,           md5           ) \
+     ACTION( HASH_CRC16,         crc16         ) \
+     ACTION( HASH_CRC32,         crc32         ) \
++    ACTION( HASH_CRC32A,        crc32a        ) \
+     ACTION( HASH_FNV1_64,       fnv1_64       ) \
+     ACTION( HASH_FNV1A_64,      fnv1a_64      ) \
+     ACTION( HASH_FNV1_32,       fnv1_32       ) \
+@@ -56,8 +57,9 @@ typedef enum dist_type {
+ uint32_t hash_one_at_a_time(const char *key, size_t key_length);
+ void md5_signature(const unsigned char *key, unsigned int length, unsigned char *result);
+ uint32_t hash_md5(const char *key, size_t key_length);
+-uint32_t hash_crc32(const char *key, size_t key_length);
+ uint32_t hash_crc16(const char *key, size_t key_length);
++uint32_t hash_crc32(const char *key, size_t key_length);
++uint32_t hash_crc32a(const char *key, size_t key_length);
+ uint32_t hash_fnv1_64(const char *key, size_t key_length);
+ uint32_t hash_fnv1a_64(const char *key, size_t key_length);
+ uint32_t hash_fnv1_32(const char *key, size_t key_length);
+--- /dev/null
++++ twemproxy-0.2.4/man/nutcracker.8
+@@ -0,0 +1,76 @@
++.TH NUTCRACKER 8 "June 13, 2013"
++.SH NAME
++nutcracker \- Fast, light-weight proxy for memcached and Redis
++.SH SYNOPSIS
++.B nutcracker
++.RI [ options ]
++.SH DESCRIPTION
++\fBnutcracker\fP, also known as \fBtwemproxy\fP (pronounced "two-em-proxy"), is
++a fast and lightweight proxy for the memcached and Redis protocols.
++.PP
++It was primarily built to reduce the connection count on backend caching
++servers, but it has a number of features, such as:
++.IP \[bu]
++Maintains persistent server connections to backend servers.
++.IP \[bu]
++Enables pipelining of requests and responses.
++.IP \[bu]
++Supports multiple server pools simultaneously.
++.IP \[bu]
++Shard data automatically across multiple servers.
++.IP \[bu]
++Supports multiple hashing modes including consistent hashing and
++distribution.
++.IP \[bu]
++High-availability by disabling nodes on failures.
++.IP \[bu]
++Observability through stats exposed on stats monitoring port.
++.SH OPTIONS
++.TP
++.BR \-h ", " \-\-help
++Show usage information and exit.
++.TP
++.BR \-V ", " \-\-version
++Show version and exit.
++.TP
++.BR \-t ", " \-\-test-conf
++Test configuration for syntax errors and exit.
++.TP
++.BR \-D ", " \-\-describe-stats
++Print stats description and exit.
++.TP
++.BR \-v ", " \-\-verbosity=\fIN\fP
++Set logging level to \fIN\fP. (default: 5, min: 0, max: 11)
++.TP
++.BR \-o ", " \-\-output=\fIfilename\fP
++Set logging file to \fIfilename\fP.
++.TP
++.BR \-c ", " \-\-conf-file=\fIfilename\fP
++Set configuration file to \fIfilename\fP.
++.TP
++.BR \-s ", " \-\-stats-port=\fIport\fP
++Set stats monitoring port to \fIport\fP.
++(default: 22222)
++.TP
++.BR \-a ", " \-\-stats-addr=\fIaddress\fP
++Set stats monitoring IP to \fIaddress\fP.
++(default: 0.0.0.0)
++.TP
++.BR \-i ", " \-\-stats-interval=\fIinterval\fP
++Set stats aggregation interval in msec to \fIinterval\fP.
++(default: 30000 msec)
++.TP
++.BR \-m ", " \-\-mbuf-size=\fIsize\fP
++Set size of mbuf chunk in bytes to \fIsize\fP. (default: 16384 bytes)
++.TP
++.BR \-d ", " \-\-daemonize
++Run as a daemon.
++.TP
++.BR \-p ", " \-\-pid-file=\fIfilename\fP
++Set pid file to \fIfilename\fP.
++.SH SEE ALSO
++.BR memcached (8),
++.BR redis-server (1)
++.br
++.SH AUTHOR
++nutcracker was written by Twitter, Inc.
