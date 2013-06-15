@@ -1,5 +1,10 @@
 twemproxy (0.2.4-1) precise; urgency=low
 
+  * Fixed versioning for precise
+
+ -- Sam Kottler <shk@linux.com>  Sat, 15 Jun 2013 13:11:45 -0400
+twemproxy (0.2.4-1) precise; urgency=low
+
   * Initial release
 
  -- Sam Kottler <shk@linux.com>  Sat, 01 Jun 2013 13:11:45 -0400
