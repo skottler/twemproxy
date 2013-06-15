@@ -1,0 +1,11 @@
+Format-Specification: http://svn.debian.org/wsvn/dep/web/deps/dep5.mdwn?op=file&rev=135
+Name: twemproxy
+Maintainer: Sam Kottler <shk@linux.com>
+Source: https://github.com/twitter/twemproxy
+
+Copyright: 2012 Twiter Inc <twitter@twitter.com>
+License: Apache 2.0
+
+Files: debian/*
+Copyright: 2013 Sam Kottler <shk@linux.com>
+License: GPL-2+
