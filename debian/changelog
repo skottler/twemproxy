@@ -1,8 +1,10 @@
-twemproxy (0.2.4-1) precise; urgency=low
+twemproxy (0.2.4-1.1) precise; urgency=low
 
-  * Fixed versioning for precise
+  * Non-maintainer upload.
+  * Fixed some issues
 
- -- Sam Kottler <shk@linux.com>  Sat, 15 Jun 2013 13:11:45 -0400
+ -- Sam Kottler <shk@linux.com>  Sat, 15 Jun 2013 08:34:45 -0400
+
 twemproxy (0.2.4-1) precise; urgency=low
 
   * Initial release
