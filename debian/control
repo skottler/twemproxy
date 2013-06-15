@@ -1,0 +1,14 @@
+Source: twemproxy
+Section: database
+Priority: extra
+Maintainer: Sam Kottler <shk@linux.com>
+Build-Depends: debhelper (>= 8.0.0), autotools-dev
+Standards-Version: 3.9.2
+Homepage: https://github.com/twitter/twemproxy
+#Vcs-Git: git://git.debian.org/collab-maint/twemproxy.git
+#Vcs-Browser: http://git.debian.org/?p=collab-maint/twemproxy.git;a=summary
+
+Package: twemproxy
+Architecture: amd64
+Depends: ${misc:Depends}
+Description: A fast and lightweight proxy for memcached and redis protocol.
